@@ -88,6 +88,50 @@ async def mywhoosh_create_workout(
     return out
 
 
+def _content(w: dict) -> dict:
+    """The parts an edit can change; used to see whether the stored workout shows the edit."""
+    s = summarize(w, include_steps=True)
+    return {k: s[k] for k in ("name", "description", "erg_mode", "duration_min", "steps")}
+
+
+@server.tool()
+async def mywhoosh_update_workout(
+    workout_id: int,
+    name: str,
+    blocks: list[Block],
+    erg_mode: bool = False,
+    description: str = "",
+    ftp_watts: int | None = None,
+) -> dict:
+    """Replace an existing custom workout in place (same id), e.g. to fix a typo or change targets.
+
+    Same arguments as mywhoosh_create_workout plus workout_id; the whole workout is replaced.
+    The id stays, so calendar entries keep pointing at it. Calendar entries keep their own copy
+    of name and TSS, which is not updated: re-schedule if those must change.
+    """
+    if not blocks:
+        raise MyWhooshError("blocks must not be empty")
+    w = build_workout(name, blocks, description=description, erg_mode=erg_mode,
+                      ftp_watts=ftp_watts, workout_id=workout_id)
+    async with _write_lock:
+        old = next((x for x in await _client.list_workouts() if x.get("Id") == workout_id), None)
+        if old is None:
+            raise MyWhooshError(f"No custom workout with id {workout_id}")
+        for keep in ("IsFavorite", "CompletedCount"):
+            if keep in old:
+                w[keep] = old[keep]
+        # An upload with an existing Id overwrites that workout instead of adding one.
+        await _client.upload_workouts([w])
+        want = _content(w)
+        ws = await _wait_for(lambda ws: [_content(x) for x in ws if x.get("Id") == workout_id] == [want])
+    out = {"confirmed": ws is not None, "workout": summarize(w),
+           "previous": summarize(old, include_steps=False)}
+    if ws is None:
+        out["warning"] = (f"Upload accepted, but after {CONFIRM_TIMEOUT_S:.0f}s there is not exactly one "
+                          f"workout with id {workout_id} showing the edit; check mywhoosh_list_workouts.")
+    return out
+
+
 @server.tool()
 async def mywhoosh_delete_workout(workout_id: int, force: bool = False) -> dict:
     """Delete a custom cycling workout by id (see mywhoosh_list_workouts).
@@ -227,6 +271,47 @@ async def mywhoosh_unschedule_workout(task_id: str) -> dict:
     """Remove a calendar entry by task_id (from mywhoosh_list_scheduled_workouts). The workout itself stays."""
     res = await _client.delete_task(task_id)
     return {"unscheduled": True, "response": res}
+
+
+# --- profile / FTP ----------------------------------------------------------------------
+
+
+@server.tool()
+async def mywhoosh_get_profile() -> dict:
+    """FTP, weight, height and best power values stored in the MyWhoosh profile.
+
+    Workout targets in MyWhoosh are % of this FTP, so check it before planning watt targets.
+    """
+    pd = await _client.player_data()
+    p = (pd.get("PlayerDataStruct") or {}).get("PlayerPersonalStruct") or {}
+    prof = (pd.get("PlayerDataStruct") or {}).get("PlayerProfileStruct") or {}
+    return {
+        "ftp_watts": p.get("FtpPlayer"),
+        "weight_kg": prof.get("Weight"),
+        "verified_weight_kg": p.get("VerifiedWeight"),
+        "height_cm": prof.get("HeightCm"),
+        "best_power": {k.removeprefix("BestPower"): v for k, v in p.items()
+                       if k.startswith("BestPower") and v},
+        "max_power": p.get("MaxPower"),
+    }
+
+
+@server.tool()
+async def mywhoosh_set_ftp(ftp_watts: int) -> dict:
+    """Set the cycling FTP in the MyWhoosh profile (watts, 50-600).
+
+    Rewrites the profile with only FtpPlayer changed and verifies that nothing else changed.
+    """
+    if not 50 <= ftp_watts <= 600:
+        raise MyWhooshError("ftp_watts must be between 50 and 600")
+    async with _write_lock:
+        res = await _client.set_ftp(ftp_watts)
+    expected = ["PlayerDataStruct.PlayerPersonalStruct.FtpPlayer"]
+    ok = res["after"] == float(ftp_watts) and res["changed_fields"] in ([], expected)
+    out = {"confirmed": ok, "before": res["before"], "after": res["after"]}
+    if not ok:
+        out["warning"] = f"Unexpected result, changed fields: {res['changed_fields']}"
+    return out
 
 
 def main() -> None:
