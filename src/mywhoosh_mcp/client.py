@@ -24,6 +24,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 LOGIN_URL = "https://services.mywhoosh.com/http-service/api/login"
 COACHING = "https://coaching.mywhoosh.com/api/v2"
 CALENDAR = "https://service14.mywhoosh.com/v1"
+# Game profile (FTP, weight, ...). POST Action 1052 reads, PUT Action 1051 writes the whole profile.
+PLAYER_DATA = "https://services.mywhoosh.com/http-service/v1/player/player-data"
 KEYCHAIN_SERVICE = "mywhoosh-mcp"
 TIMEOUT = 30.0
 # MyWhoosh allows only one active session: while the app is logged in, a new API login
@@ -198,11 +200,6 @@ class MyWhooshClient:
             return {}
         d = (r.json() or {}).get("data") or {}
         return {"free_slots": d.get("CurrentCredits"), "subscription": d.get("IsSubscriptionExists")}
-        with zipfile.ZipFile(io.BytesIO(z.content)) as zf:
-            for name in zf.namelist():
-                if name.endswith(".json"):
-                    workouts.append(json.loads(zf.read(name)))
-        return workouts
 
     async def delete_usage(self, workout_id: int, sport: str = "cycling") -> list:
         """Training plans etc. that reference the workout (same pre-check as the web editor)."""
@@ -263,3 +260,60 @@ class MyWhooshClient:
     async def delete_task(self, task_id: str) -> Any:
         r = await self._request("DELETE", f"/task/{task_id}", base=CALENDAR)
         return self._json(r, "Unschedule")
+
+    # --- player profile (FTP) ------------------------------------------------------------
+
+    def _user_id(self) -> str:
+        p = (self._token or "").split(".")[1] if self._token and "." in self._token else ""
+        p += "=" * (-len(p) % 4)
+        try:
+            return json.loads(base64.urlsafe_b64decode(p))["userId"]
+        except Exception as e:
+            raise MyWhooshError("Could not read the user id from the access token") from e
+
+    async def _player_call(self, method: str, action: int, extra: dict | None = None) -> httpx.Response:
+        for attempt in range(2):
+            if not self._token:
+                await self._login()
+            r = await self._http.request(method, PLAYER_DATA, headers={"Authorization": f"Bearer {self._token}"},
+                                         json={"WhooshId": self._user_id(), "Action": action,
+                                               "CorrelationId": str(uuid.uuid4()), "DeviceId": _device_id(),
+                                               "Authorization": "", **(extra or {})})
+            if r.status_code == 401 and attempt == 0:
+                self._token = None
+                _store_token(None)
+                continue
+            return r
+        return r
+
+    async def player_data(self) -> dict:
+        r = await self._player_call("POST", 1052)
+        if r.status_code != 200:
+            raise MyWhooshError(f"Reading player data failed ({r.status_code}): {r.text[:200]}")
+        return r.json()
+
+    async def set_ftp(self, watts: float) -> dict:
+        """Read-modify-write of the player profile, changing only FtpPlayer; verified afterwards."""
+        before = await self.player_data()
+        new = json.loads(json.dumps(before))
+        new["PlayerDataStruct"]["PlayerPersonalStruct"]["FtpPlayer"] = float(watts)
+        r = await self._player_call("PUT", 1051, {"PlayerData": json.dumps(new)})
+        if r.status_code != 200:
+            raise MyWhooshError(f"Writing player data failed ({r.status_code}): {r.text[:200]}")
+        after = await self.player_data()
+        fb, fa = _flat(before), _flat(after)
+        changed = sorted(k for k in fb.keys() | fa.keys() if fb.get(k) != fa.get(k))
+        return {"before": _ftp(before), "after": _ftp(after), "changed_fields": changed}
+
+
+def _flat(o: Any, p: str = "") -> dict:
+    if isinstance(o, dict):
+        out: dict = {}
+        for k, v in o.items():
+            out |= _flat(v, f"{p}.{k}" if p else k)
+        return out
+    return {p: o}
+
+
+def _ftp(pd: dict) -> float | None:
+    return ((pd.get("PlayerDataStruct") or {}).get("PlayerPersonalStruct") or {}).get("FtpPlayer")
